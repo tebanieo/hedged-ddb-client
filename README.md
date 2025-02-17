@@ -79,8 +79,10 @@ Example:
 ```bash
 cargo run --release -- --max-threads 8 --batch-size 100 --test-duration 300 --percentile 95 --warmup-duration 60
 
-cargo run --release -- --max-threads 4 --batch-size 50 --test-duration 10 --percentile 80 --warmup-duration 5
+cargo run -- --max-threads 4 --batch-size 100 --test-duration 15 --percentile 80 --warmup-duration 10
 ```
+
+![DynamoDB](./docs/hedge.gif)
 
 ## How it works
 

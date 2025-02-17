@@ -59,6 +59,7 @@ struct Metrics {
     first_requests_won: usize,
     second_requests_won: usize,
     second_requests_sent: usize,
+    start_time: Instant,
 }
 
 impl Metrics {
@@ -71,6 +72,7 @@ impl Metrics {
             first_requests_won: 0,
             second_requests_won: 0,
             second_requests_sent: 0,
+            start_time: Instant::now(),
         }
     }
 
@@ -161,7 +163,7 @@ async fn async_main(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             let start = Instant::now();
             while start.elapsed().as_secs() < args.warmup_duration {
                 progress.set_position(start.elapsed().as_secs());
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                tokio::time::sleep(Duration::from_millis(250)).await;
             }
         })
     };
@@ -224,7 +226,6 @@ async fn async_main(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
 
-    // Spawn a task to update the progress bars
     let update_progress = {
         let metrics = Arc::clone(&metrics);
         let main_progress = main_progress.clone();
@@ -235,7 +236,8 @@ async fn async_main(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             let start = Instant::now();
             while start.elapsed().as_secs() < test_duration {
                 tokio::time::sleep(Duration::from_millis(100)).await;
-                main_progress.set_position(start.elapsed().as_secs());
+                let elapsed = start.elapsed().as_secs();
+                main_progress.set_position(elapsed);
                 update_stats_display(&metrics, percentile, &stats_progress);
             }
         })
@@ -359,7 +361,10 @@ async fn run_load_test(
         );
 
         if thread_id == 0 {
+            // Update main progress bar
             main_progress.set_position(start_time.elapsed().as_secs());
+
+            // Update stats display
             update_stats_display(&metrics, args.percentile, &stats_progress);
         }
 
@@ -466,9 +471,12 @@ fn update_metrics(
 
 fn update_stats_display(metrics: &Arc<Mutex<Metrics>>, percentile: f64, progress: &ProgressBar) {
     let metrics = metrics.lock().unwrap();
+    let total_duration = metrics.start_time.elapsed().as_secs_f64();
+    let ops_per_second = (metrics.total_operations as f64) / total_duration;
     let stats = format!(
-        "Ops: {} | Succ: {} | Fail: {} | 1st: {} | 2nd: {} | 2nd Sent: {} | {}th ile: {:.2}ms | 95th ile: {:.2}ms | 99th ile: {:.2}ms",
+        "Ops: {} ({:.2}/s) | Succ: {} | Fail: {} | 1st: {} | 2nd: {} | 2nd Sent: {} | {}th ile: {:.2}ms | 95th ile: {:.2}ms | 99th ile: {:.2}ms",
         metrics.total_operations,
+        ops_per_second,
         metrics.total_successes,
         metrics.total_failures,
         metrics.first_requests_won,
