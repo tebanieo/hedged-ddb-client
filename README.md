@@ -23,7 +23,7 @@ This project provides a hedged request client for Amazon DynamoDB and a load tes
 1. Ensure you have Rust and Cargo installed on your system.
 2. Clone this repository:
 
-git clone https://github.com/tebanieo/ddb-hedged-request.git cd dynamodb-hedged-request
+git clone https://github.com/tebanieo/hedged-ddb-client.git cd hedged-ddb-client
 
 3. Build the project:
 cargo build --release
