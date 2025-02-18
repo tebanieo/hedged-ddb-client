@@ -82,7 +82,7 @@ cargo run --release -- --max-threads 8 --batch-size 100 --test-duration 300 --pe
 cargo run -- --max-threads 4 --batch-size 100 --test-duration 15 --percentile 80 --warmup-duration 10
 ```
 
-![DynamoDB](./docs/hedge.gif)
+
 
 ## How it works
 
