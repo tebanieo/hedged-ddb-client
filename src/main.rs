@@ -1,7 +1,15 @@
-use ddb_hedged_request::HedgedDynamoClient;
-use rusoto_core::Region;
-use rusoto_dynamodb::{ AttributeValue, GetItemInput };
-use std::{ collections::HashMap, time::{ Instant, Duration }, sync::{ Arc, Mutex } };
+mod hedged_client;
+mod dynamodb_operations;
+mod load_test;
+mod metrics;
+
+use crate::hedged_client::HedgedDynamoClient;
+use crate::load_test::LoadTestConfig;
+use aws_config::meta::region::RegionProviderChain;
+use aws_types::region::Region;
+use aws_types::sdk_config::SdkConfig;
+use std::sync::Arc;
+use std::time::Duration;
 use log4rs::{
     append::rolling_file::{
         RollingFileAppender,
@@ -15,85 +23,29 @@ use log4rs::{
     encode::pattern::PatternEncoder,
 };
 use log::LevelFilter;
+use chrono::Utc;
+use std::error::Error;
+use std::fs;
+use rand::seq::SliceRandom;
 
-use futures::future::join_all;
-use log::info;
-use tokio::time;
-use tokio::runtime::Runtime;
-use num_cpus;
-use std::cmp;
-use hdrhistogram::Histogram;
-use clap::Parser;
-use indicatif::{ ProgressBar, ProgressStyle, MultiProgress };
+use std::fs::File;
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use serde_json::Value;
+use indicatif::{ProgressBar, ProgressStyle};
+use std::time::Instant;
+use crate::metrics::TestRunResult;
 
-const DEFAULT_DELAY: u64 = 3000; //3 seconds
+use std::io::Write;
 
-#[derive(Parser, Debug, Clone)]
-#[clap(author, version, about, long_about = None)]
-struct Args {
-    #[clap(long, default_value_t = 4)]
-    max_threads: usize,
+fn setup_logging(test_id: &str) -> Result<(), Box<dyn Error>> {
+    // Create a directory for this test run
+    let log_dir = format!("./log/{}", test_id);
+    fs::create_dir_all(&log_dir)?;
 
-    #[clap(long, default_value_t = 50)]
-    batch_size: usize,
-
-    #[clap(long, default_value_t = 0)]
-    delay_between_batches: u64,
-
-    #[clap(long, default_value_t = 10)]
-    test_duration: u64,
-
-    #[clap(long, default_value_t = 70.0)]
-    percentile: f64,
-
-    #[clap(long, default_value_t = 30)] // 30 seconds
-    warmup_duration: u64,
-}
-
-#[derive(Clone)]
-struct Metrics {
-    histogram: Histogram<u64>,
-    total_operations: usize,
-    total_successes: usize,
-    total_failures: usize,
-    first_requests_won: usize,
-    second_requests_won: usize,
-    second_requests_sent: usize,
-    start_time: Instant,
-}
-
-impl Metrics {
-    fn new() -> Self {
-        Metrics {
-            histogram: Histogram::<u64>::new(3).unwrap(),
-            total_operations: 0,
-            total_successes: 0,
-            total_failures: 0,
-            first_requests_won: 0,
-            second_requests_won: 0,
-            second_requests_sent: 0,
-            start_time: Instant::now(),
-        }
-    }
-
-    fn calculate_new_delay(&self, percentile: f64) -> u64 {
-        let value_at_percentile = self.histogram.value_at_quantile(percentile / 100.0);
-        ((value_at_percentile as f64) / 1_000.0) as u64 // Convert to millis
-    }
-}
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
-    setup_logging()?;
-    let runtime = Runtime::new()?;
-    println!("Args: {:?}", args);
-    runtime.block_on(async_main(args))
-}
-
-fn setup_logging() -> Result<(), Box<dyn std::error::Error>> {
     // Set up the roller
-    let window_size = 20; // Keep 3 archived log files
-    let fixed_window_roller = FixedWindowRoller::builder().build("log/output-{}.log", window_size)?;
+    let window_size = 5; // Keep 5 archived log files
+    let fixed_window_roller = FixedWindowRoller::builder()
+        .build(&format!("{}/output-{{}}.log", log_dir), window_size)?;
 
     // Set up the size-based trigger policy
     let size_limit = 10 * 1024 * 1024; // 10MB
@@ -108,7 +60,7 @@ fn setup_logging() -> Result<(), Box<dyn std::error::Error>> {
     // Set up the rolling file appender
     let rolling_appender = RollingFileAppender::builder()
         .encoder(Box::new(PatternEncoder::new("{d} - {l} - {m}{n}")))
-        .build("log/output.log", Box::new(compound_policy))?;
+        .build(&format!("{}/output.log", log_dir), Box::new(compound_policy))?;
 
     // Build the log4rs config
     let config = Config::builder()
@@ -121,424 +73,181 @@ fn setup_logging() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn get_num_threads(max_threads: usize) -> usize {
-    cmp::min(max_threads, num_cpus::get())
-}
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let date_test = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+    let _ = setup_logging(&date_test);    
+    let results_dir = ".";
+    fs::create_dir_all(results_dir)?; // Create the directory if it doesn't exist
+    let csv_filename = format!("{}/test_results_{}.csv", results_dir, date_test);
 
-async fn async_main(args: Args) -> Result<(), Box<dyn std::error::Error>> {
-    let num_threads = get_num_threads(args.max_threads);
-    info!("Running with {} threads", num_threads);
+    let region_provider = RegionProviderChain::default_provider().or_else(Region::new("us-east-1"));
+    let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
+        .region(region_provider)
+        .load()
+        .await;
 
-    let metrics = Arc::new(Mutex::new(Metrics::new()));
+    let file_path = "sample_data.json";
+    let items = load_items_from_file(file_path)?;
+    println!("Total items loaded: {}", items.len());
 
-    // Warm-up phase
-    info!("Starting warm-up phase for {} seconds", args.warmup_duration);
-    let warmup_progress = ProgressBar::new(args.warmup_duration);
-    warmup_progress.set_style(
-        ProgressStyle::default_bar()
-            .template(
-                "{spinner:.green} Warm-up: [{elapsed_precise}] [{bar:40.yellow/blue}] {pos}/{len} ({eta})"
-            )
-            .unwrap()
-            .progress_chars("#>-")
-    );
+    let test_items = pick_random_items(&items, 10000);
 
-    let warmup_progress = Arc::new(warmup_progress);
+    // Define the percentiles to test
+    let percentiles = vec![99.0, 90.0, 75.0, 50.0, 10.0];
 
-    let warmup_handles: Vec<_> = (0..num_threads)
-        .map(|thread_id| {
-            let metrics = Arc::clone(&metrics);
-            let args = args.clone();
-            let progress = Arc::clone(&warmup_progress);
-            tokio::spawn(async move {
-                run_warmup(thread_id, metrics, &args, progress).await;
-            })
-        })
-        .collect();
+    // Number of iterations for the entire test suite
+    let num_iterations = 5;
 
-    // Spawn a task to keep the progress bar updated
-    let warmup_progress_handle = {
-        let progress = Arc::clone(&warmup_progress);
-        tokio::spawn(async move {
-            let start = Instant::now();
-            while start.elapsed().as_secs() < args.warmup_duration {
-                progress.set_position(start.elapsed().as_secs());
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-        })
-    };
+    let mut all_results = Vec::new();
+    let mut initial_delay = None;
 
-    for handle in warmup_handles {
-        handle.await?;
+    for iteration in 1..=num_iterations {
+        println!("Starting iteration {} of {}", iteration, num_iterations);
+
+        // Run non-hedged test first
+        println!("Running non-hedged test for iteration {}", iteration);
+        let non_hedged_result = run_single_test(&config, &test_items, None, iteration, &date_test, None).await?;
+        all_results.push(non_hedged_result.clone());
+
+        // Run hedged tests for all percentiles
+        for &percentile in &percentiles {
+            // Calculate initial delay for hedged tests based on non-hedged results
+            initial_delay = Some(Duration::from_micros(non_hedged_result.metrics.calculate_percentile(percentile) as u64));
+            println!("Running hedged test for p{} in iteration {}", percentile, iteration);
+            let hedged_result = run_single_test(&config, &test_items, Some(percentile), iteration, &date_test, initial_delay).await?;
+            all_results.push(hedged_result);
+        }
+
+        println!("Completed iteration {}", iteration);
     }
 
-    // Wait for the progress bar update task to finish
-    warmup_progress_handle.await?;
+    // Generate CSV with all results
+    generate_csv_report(&all_results, &csv_filename)?;
 
-    warmup_progress.finish_with_message("Warm-up completed");
-
-    // Calculate the new hedging delay based on warm-up metrics
-    let initial_hedging_delay = {
-        let warmup_metrics = metrics.lock().unwrap();
-        warmup_metrics.calculate_new_delay(args.percentile)
-    };
-
-    info!("Initial hedging delay after warm-up: {} ms", initial_hedging_delay);
-
-    // Reset metrics for the actual test
-    let warmup_metrics = metrics.lock().unwrap().clone();
-    *metrics.lock().unwrap() = Metrics::new();
-
-    // Actual load test
-    info!("Starting load test for {} seconds", args.test_duration);
-    let start_time = Instant::now();
-
-    let multi_progress = Arc::new(MultiProgress::new());
-    let main_progress = multi_progress.add(ProgressBar::new(args.test_duration as u64));
-    main_progress.set_style(
-        ProgressStyle::default_bar()
-            .template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta})"
-            )
-            .unwrap()
-            .progress_chars("#>-")
-    );
-
-    let stats_progress = multi_progress.add(ProgressBar::new(1));
-    stats_progress.set_style(ProgressStyle::default_bar().template("{wide_msg}").unwrap());
-
-    let handles: Vec<_> = (0..num_threads)
-        .map(|thread_id| {
-            let metrics = Arc::clone(&metrics);
-            let args = args.clone();
-            let main_pb = main_progress.clone();
-            let stats_pb = stats_progress.clone();
-            tokio::spawn(async move {
-                run_load_test(
-                    thread_id,
-                    metrics,
-                    &args,
-                    main_pb,
-                    stats_pb,
-                    initial_hedging_delay
-                ).await;
-            })
-        })
-        .collect();
-
-    let update_progress = {
-        let metrics = Arc::clone(&metrics);
-        let main_progress = main_progress.clone();
-        let stats_progress = stats_progress.clone();
-        let percentile = args.percentile;
-        let test_duration = args.test_duration;
-        tokio::spawn(async move {
-            let start = Instant::now();
-            while start.elapsed().as_secs() < test_duration {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                let elapsed = start.elapsed().as_secs();
-                main_progress.set_position(elapsed);
-                update_stats_display(&metrics, percentile, &stats_progress);
-            }
-        })
-    };
-
-    // Wait for all load test threads to complete
-    for handle in handles {
-        handle.await?;
-    }
-
-    // Wait for the progress update task to complete
-    update_progress.await?;
-
-    main_progress.finish_with_message("Load test completed");
-
-    let total_duration = start_time.elapsed();
-    let metrics = metrics.lock().unwrap();
-    log_results(&metrics, &warmup_metrics, total_duration, args.percentile);
-
+    println!("All load tests completed");
+    println!("Test results have been saved to {}", csv_filename);
     Ok(())
 }
 
-async fn run_warmup(
-    thread_id: usize,
-    metrics: Arc<Mutex<Metrics>>,
-    args: &Args,
-    progress: Arc<ProgressBar>
-) {
-    let client = Arc::new(
-        HedgedDynamoClient::new(Region::UsEast1, Duration::from_millis(DEFAULT_DELAY))
-    );
-    let table_name = "describe_sample_table".to_string();
+fn load_items_from_file(file_path: &str) -> Result<Vec<Value>, Box<dyn Error>> {
+    let file = File::open(file_path)?;
+    let mut reader = BufReader::new(file);
 
+    // Get the total file size
+    let file_size = reader.seek(SeekFrom::End(0))?;
+    reader.seek(SeekFrom::Start(0))?;
+
+    let pb = ProgressBar::new(file_size);
+    pb.set_style(ProgressStyle::default_bar()
+        .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+        .unwrap()
+        .progress_chars("#>-"));
+
+    let mut items = Vec::new();
     let start_time = Instant::now();
-    let warmup_duration = Duration::from_secs(args.warmup_duration);
 
-    while start_time.elapsed() < warmup_duration {
-        let batch_start = Instant::now();
-        let (successes, failures, first_won, second_won, second_sent) = send_batch(
-            &client,
-            &table_name,
-            args.batch_size
-        ).await;
-        let batch_duration = batch_start.elapsed();
-
-        update_metrics(
-            metrics.clone(),
-            args.batch_size,
-            successes,
-            failures,
-            first_won,
-            second_won,
-            second_sent,
-            batch_duration,
-            thread_id
-        );
-
-        if thread_id == 0 {
-            progress.clone().set_position(start_time.elapsed().as_secs());
+    for line in reader.lines() {
+        let line = line?;
+        let value: Value = serde_json::from_str(&line)?;
+        if let Some(item) = value.get("Item") {
+            items.push(item.clone());
         }
-
-        if start_time.elapsed().as_secs() % 5 == 0 {
-            let new_delay = {
-                let metrics = metrics.lock().unwrap();
-                metrics.calculate_new_delay(args.percentile)
-            };
-            client.update_hedging_delay(Duration::from_millis(new_delay));
-            info!(
-                "Warm-up: Updated hedging delay to {} ms - {}th percentile",
-                new_delay,
-                args.percentile
-            );
-        }
-
-        if
-            start_time.elapsed() + Duration::from_millis(args.delay_between_batches) >
-            warmup_duration
-        {
-            break;
-        }
-
-        time::sleep(Duration::from_millis(args.delay_between_batches)).await;
+        pb.inc(line.len() as u64 + 1); // +1 for the newline character
     }
+
+    pb.finish_with_message("Done");
+    let duration = start_time.elapsed();
+
+    println!("Loaded {} items in {:.2?}", items.len(), duration);
+
+    Ok(items)
 }
 
-async fn run_load_test(
-    thread_id: usize,
-    metrics: Arc<Mutex<Metrics>>,
-    args: &Args,
-    main_progress: ProgressBar,
-    stats_progress: ProgressBar,
-    initial_hedging_delay: u64
-) {
-    let client = Arc::new(
-        HedgedDynamoClient::new(Region::UsEast1, Duration::from_millis(initial_hedging_delay))
-    );
-    let table_name = "describe_sample_table".to_string();
+fn pick_random_items(items: &[Value], n: usize) -> Vec<Value> {
+    let mut rng = rand::thread_rng();
+    items.choose_multiple(&mut rng, n).cloned().collect()
+}
 
-    let start_time = Instant::now();
-    let test_duration = Duration::from_secs(args.test_duration);
+async fn run_single_test(
+    config: &SdkConfig,
+    test_items: &[Value],
+    percentile: Option<f64>,
+    iteration: usize,
+    date_test: &str,
+    initial_delay: Option<Duration>,
+) -> Result<TestRunResult, Box<dyn std::error::Error>> {
+    let is_hedging_enabled = percentile.is_some();
+    let client = Arc::new(HedgedDynamoClient::new(
+        config,
+        if is_hedging_enabled {
+            Duration::from_millis(10) // Initial hedging delay when enabled
+        } else {
+            Duration::from_secs(1) // Large delay when disabled
+        },
+        is_hedging_enabled
+    ));
 
-    while start_time.elapsed() < test_duration {
-        let batch_start = Instant::now();
-        let (successes, failures, first_won, second_won, second_sent) = send_batch(
-            &client,
-            &table_name,
-            args.batch_size
-        ).await;
-        let batch_duration = batch_start.elapsed();
+    let test_type = if is_hedging_enabled { 
+        format!("hedged_p{}", percentile.unwrap())
+    } else {
+        "non_hedged".to_string()
+    };
 
-        update_metrics(
-            metrics.clone(),
-            args.batch_size,
-            successes,
-            failures,
-            first_won,
-            second_won,
-            second_sent,
-            batch_duration,
-            thread_id
-        );
+    let load_test_config = LoadTestConfig {
+        warm_up_duration: Duration::from_secs(60),
+        ramp_up_duration: Duration::from_secs(120),
+        main_test_duration: Duration::from_secs(600),
+        update_hedging_duration: Duration::from_secs(10),
+        test_id: format!("{}_iter{}_{}", date_test, iteration, test_type),
+        percentile: percentile.unwrap_or(0.0), // Use 0.0 for non-hedged tests
+        test_items: test_items.to_vec(),
+    };
 
-        if thread_id == 0 {
-            // Update main progress bar
-            main_progress.set_position(start_time.elapsed().as_secs());
+    load_test::run_full_load_test(
+        client,
+        "sample-org-table".to_string(),
+        load_test_config,
+        initial_delay
+    ).await
+}
 
-            // Update stats display
-            update_stats_display(&metrics, args.percentile, &stats_progress);
-        }
+fn generate_csv_report(results: &[TestRunResult], filename: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut file = File::create(filename)?;
+    
+    // Write header
+    writeln!(file, "Iteration,Test Type,Percentile,Total Requests,Successful Requests,Failed Requests,First Requests Won,Second Requests Won,Second Requests Sent,Requests per Second,Success Rate,Hedging Rate,Second Request Win Rate,P1 Latency (ms),P25 Latency (ms),P50 Latency (ms),P75 Latency (ms),P90 Latency (ms),P95 Latency (ms),P99 Latency (ms),P99.9 Latency (ms)")?;
 
-        if start_time.elapsed().as_secs() % 5 == 0 {
-            let new_delay = {
-                let metrics = metrics.lock().unwrap();
-                metrics.calculate_new_delay(args.percentile)
-            };
-            client.update_hedging_delay(Duration::from_millis(new_delay));
-            info!("Updated hedging delay to {} ms - {}th percentile", new_delay, args.percentile);
-        }
-
-        if start_time.elapsed() + Duration::from_millis(args.delay_between_batches) > test_duration {
-            break;
-        }
-
-        time::sleep(Duration::from_millis(args.delay_between_batches)).await;
+    // Write data
+    for (index, result) in results.iter().enumerate() {
+        let iteration = index / 6; // 7 tests per iteration (1 non-hedged + 6 hedged)
+        let test_type = if result.percentile == 0.0 { "Non-Hedged" } else { "Hedged" };
+        let percentile = format!("{:.1}", result.percentile) ;
+        
+        writeln!(file, "{},{},{},{},{},{},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2}",
+            iteration,
+            test_type,
+            percentile,
+            result.total_requests,
+            result.successful_requests,
+            result.failed_requests,
+            result.first_requests_won,
+            result.second_requests_won,
+            result.second_requests_sent,
+            result.requests_per_second,
+            result.success_rate,
+            result.hedging_rate,
+            result.second_request_win_rate,
+            result.p1_latency,
+            result.p25_latency,
+            result.p50_latency,
+            result.p75_latency,
+            result.p90_latency,
+            result.p95_latency,
+            result.p99_latency,
+            result.p999_latency
+        )?;
     }
-}
 
-async fn send_batch(
-    client: &HedgedDynamoClient,
-    table_name: &str,
-    batch_size: usize
-) -> (usize, usize, usize, usize, usize) {
-    let requests: Vec<_> = (0..batch_size)
-        .map(|_| {
-            let mut key = HashMap::new();
-            key.insert("PK".to_string(), AttributeValue {
-                s: Some("bee".to_string()),
-                ..Default::default()
-            });
-            key.insert("SK".to_string(), AttributeValue {
-                s: Some("bee".to_string()),
-                ..Default::default()
-            });
-
-            let input = GetItemInput {
-                table_name: table_name.to_string(),
-                key,
-                ..Default::default()
-            };
-
-            client.hedged_request(input)
-        })
-        .collect();
-
-    let results = join_all(requests).await;
-
-    results
-        .into_iter()
-        .fold((0, 0, 0, 0, 0), |(successes, failures, first_won, second_won, second_sent), result| {
-            match result {
-                Ok(hedged_result) => {
-                    let first_won_inc = if hedged_result.winner_request_id == 0 { 1 } else { 0 };
-                    let second_won_inc = if hedged_result.winner_request_id != 0 { 1 } else { 0 };
-                    let second_sent_inc = if hedged_result.second_request_sent { 1 } else { 0 };
-                    (
-                        successes + 1,
-                        failures,
-                        first_won + first_won_inc,
-                        second_won + second_won_inc,
-                        second_sent + second_sent_inc,
-                    )
-                }
-                Err(_) => (successes, failures + 1, first_won, second_won, second_sent),
-            }
-        })
-}
-
-fn update_metrics(
-    metrics: Arc<Mutex<Metrics>>,
-    batch_size: usize,
-    successes: usize,
-    failures: usize,
-    first_won: usize,
-    second_won: usize,
-    second_sent: usize,
-    batch_duration: Duration,
-    thread_id: usize
-) {
-    let mut metrics = metrics.lock().unwrap();
-    metrics.total_operations += batch_size;
-    metrics.total_successes += successes;
-    metrics.total_failures += failures;
-    metrics.first_requests_won += first_won;
-    metrics.second_requests_won += second_won;
-    metrics.second_requests_sent += second_sent;
-    metrics.histogram.record(batch_duration.as_micros() as u64).unwrap();
-
-    if metrics.total_operations % 1000 == 0 {
-        info!(
-            "Thread {}: Total ops: {}, Successes: {}, Failures: {}, First won: {}, Second won: {}, Second sent: {}",
-            thread_id,
-            metrics.total_operations,
-            metrics.total_successes,
-            metrics.total_failures,
-            metrics.first_requests_won,
-            metrics.second_requests_won,
-            metrics.second_requests_sent
-        );
-    }
-}
-
-fn update_stats_display(metrics: &Arc<Mutex<Metrics>>, percentile: f64, progress: &ProgressBar) {
-    let metrics = metrics.lock().unwrap();
-    let total_duration = metrics.start_time.elapsed().as_secs_f64();
-    let ops_per_second = (metrics.total_operations as f64) / total_duration;
-    let stats = format!(
-        "Ops: {} ({:.2}/s) | Succ: {} | Fail: {} | 1st: {} | 2nd: {} | 2nd Sent: {} | {}th ile: {:.2}ms | 95th ile: {:.2}ms | 99th ile: {:.2}ms",
-        metrics.total_operations,
-        ops_per_second,
-        metrics.total_successes,
-        metrics.total_failures,
-        metrics.first_requests_won,
-        metrics.second_requests_won,
-        metrics.second_requests_sent,
-        percentile,
-        metrics.calculate_new_delay(percentile),
-        (metrics.histogram.value_at_quantile(0.95) as f64) / 1_000.0,
-        (metrics.histogram.value_at_quantile(0.99) as f64) / 1_000.0
-    );
-    progress.set_message(stats);
-}
-
-fn log_results(
-    metrics: &Metrics,
-    warmup_metrics: &Metrics,
-    total_duration: Duration,
-    percentile: f64
-) {
-    info!("All tests completed. Total time (including warm-up): {:?}", total_duration);
-    info!("Warm-up metrics:");
-    log_metrics(warmup_metrics, "Warm-up");
-    info!("Test metrics:");
-    log_metrics(metrics, "Test");
-    info!(
-        "Average operations per second: {:.2}",
-        (metrics.total_operations as f64) / total_duration.as_secs_f64()
-    );
-
-    info!("Latency percentiles (milliseconds):");
-    info!("50th percentile: {:.2}", (metrics.histogram.value_at_quantile(0.5) as f64) / 1_000.0);
-    info!("90th percentile: {:.2}", (metrics.histogram.value_at_quantile(0.9) as f64) / 1_000.0);
-    info!("95th percentile: {:.2}", (metrics.histogram.value_at_quantile(0.95) as f64) / 1_000.0);
-    info!("99th percentile: {:.2}", (metrics.histogram.value_at_quantile(0.99) as f64) / 1_000.0);
-    info!(
-        "99.9th percentile: {:.2}",
-        (metrics.histogram.value_at_quantile(0.999) as f64) / 1_000.0
-    );
-    info!("Max latency: {:.2}", (metrics.histogram.max() as f64) / 1_000.0);
-
-    let new_hedging_delay = metrics.calculate_new_delay(percentile);
-    info!(
-        "Suggested new hedging delay ({}th percentile): {} milliseconds",
-        percentile,
-        new_hedging_delay
-    );
-
-    println!("All tests completed. Total time: {:?}", total_duration);
-    println!("Total operations: {}", metrics.total_operations);
-    println!("Total successful operations: {}", metrics.total_successes);
-    println!("Total failed operations: {}", metrics.total_failures);
-    println!("First requests won: {}", metrics.first_requests_won);
-    println!("Second requests won: {}", metrics.second_requests_won);
-    println!("Second requests sent: {}", metrics.second_requests_sent);
-    println!("");
-}
-
-fn log_metrics(metrics: &Metrics, phase: &str) {
-    info!("{} total operations: {}", phase, metrics.total_operations);
-    info!("{} successful operations: {}", phase, metrics.total_successes);
-    info!("{} failed operations: {}", phase, metrics.total_failures);
-    info!("{} first requests won: {}", phase, metrics.first_requests_won);
-    info!("{} second requests won: {}", phase, metrics.second_requests_won);
-    info!("{} second requests sent: {}", phase, metrics.second_requests_sent);
+    Ok(())
 }
