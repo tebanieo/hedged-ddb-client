@@ -1,147 +1,100 @@
-# DynamoDB Hedged Request Client and Load Tester
+# DynamoDB Hedged Client and Load Test
 
-This project provides a hedged request client for Amazon DynamoDB and a load testing tool to evaluate its performance. The hedged request strategy aims to reduce tail latency by sending a second request after a short delay if the first request hasn't completed.
+This project implements a hedged client for DynamoDB and provides a load testing framework to evaluate its performance. The hedged client sends a second request after a configurable delay if the first request hasn't returned, potentially reducing tail latency.
 
 ## Features
 
-### HedgedDynamoClient
-- Implements hedged requests for DynamoDB operations
-- Supports GetItem, Query, and BatchGetItem operations
-- Dynamically adjustable hedging delay
-- Detailed logging of request events
+- Hedged DynamoDB client implementation
+- Configurable hedging delay
+- Load testing framework with warm-up, ramp-up, and main test phases
+- Detailed metrics collection and reporting
+- Support for both hedged and non-hedged tests
+- CSV report generation for easy analysis
 
-### Load Tester
-- Multi-threaded load testing
-- Warm-up phase to establish initial metrics
-- Adaptive hedging delay based on percentile latency
-- Real-time progress and statistics display
-- Detailed metrics logging with log rotation
-- Customizable test parameters
-
-## Installation
-
-1. Ensure you have Rust and Cargo installed on your system.
-2. Clone this repository:
-
-git clone https://github.com/tebanieo/hedged-ddb-client.git cd hedged-ddb-client
-
-3. Build the project:
-cargo build --release
-
-
-## Usage
-
-### HedgedDynamoClient
-
-To use the `HedgedDynamoClient` in your own project:
-
-```rust
-use ddb_hedged_request::HedgedDynamoClient;
-use rusoto_core::Region;
-use rusoto_dynamodb::GetItemInput;
-use std::time::Duration;
-
-#[tokio::main]
-async fn main() {
- let client = HedgedDynamoClient::new(Region::UsEast1, Duration::from_millis(50));
- 
- let input = GetItemInput {
-     table_name: "YourTableName".to_string(),
-     // ... other parameters
- };
-
- let result = client.hedged_request(input).await;
- // Handle the result
-}
-```
-
-Please explore the function `send_batch` so you can build your own logic, this sample implementation uses only one record. 
-
-## Load Tester
-
-Run the load tester with:
+## Project Structure
 
 ```bash
-cargo run --release -- [OPTIONS]
+src 
+├── dynamodb_operations.rs # DynamoDB operation implementations 
+├── hedged_client.rs # Hedged client implementation 
+├── lib.rs # Library root 
+├── load_test.rs # Load testing logic 
+├── main.rs # Main application entry point 
+├── metrics.rs # Metrics collection and reporting 
+└── sample_data.json # Sample data for testing - Export to S3 from your DDB table
 ```
 
-Options
+## Requirements
 
---max-threads <MAX_THREADS>: Maximum number of threads to use (default: 4)
---batch-size <BATCH_SIZE>: Number of requests per batch (default: 50)
---delay-between-batches <DELAY>: Delay between batches in milliseconds (default: 0)
---test-duration <DURATION>: Duration of the test in seconds (default: 10)
---percentile <PERCENTILE>: Percentile to use for calculating new hedging delay (default: 70.0)
---warmup-duration <DURATION>: Duration of the warm-up phase in seconds (default: 30)
+- Rust 1.56 or later
+- AWS SDK for Rust
+- DynamoDB table for testing
 
-Example:
+## Configuration
 
-```bash
-cargo run --release -- --max-threads 8 --batch-size 100 --test-duration 300 --percentile 95 --warmup-duration 60
+Before running the load test, make sure to:
 
-cargo run -- --max-threads 4 --batch-size 100 --test-duration 15 --percentile 80 --warmup-duration 10
-```
+1. Set up your AWS credentials
+2. Update the DynamoDB table name in `main.rs`
+3. Prepare your `sample_data.json` file with test data
+
+## Running the Load Test
+
+To run the load test:
+
+cargo run --release
 
 
+This will execute a series of load tests with different configurations:
 
-## How it works
+- Non-hedged test
+- Hedged tests with percentiles: 99.0, 90.0, 75.0, 50.0, 10.0
 
-### HedgedDynamoClient
+The test suite will run for a specified number of iterations.
 
-When a request is made, the client immediately sends the first request.
-It then waits for a specified hedging delay.
-If the first request hasn't completed after the delay, a second request is sent.
-The client returns the result of whichever request completes first.
-The hedging delay can be dynamically updated based on observed latencies.
+## Output
 
-### Load Tester
+The load test will generate:
 
-- Warm-up Phase: The test starts with a warm-up phase to establish initial metrics and calculate an initial hedging delay.
-- Load Test: After warm-up, the main load test begins, using the calculated initial hedging delay.
-- Adaptive Hedging: The hedging delay is updated every 5 seconds based on the specified percentile of request latencies.
-- Multi-threading: The test uses multiple threads to generate load, with the number of threads optimized for your system.
-- Progress Display: Real-time progress and statistics are displayed during the test.
-- Logging: Detailed metrics are logged to files, with log rotation to manage file sizes.
+1. Detailed logs in the `log` directory
+2. A CSV report with test results
 
-### Metrics
+The CSV report includes metrics such as:
 
-The tool collects and reports various metrics, including:
+- Total requests
+- Successful/failed requests
+- Requests per second
+- Success rate
+- Hedging rate
+- Latency percentiles
 
-Total operations
-Successful and failed operations
-First and second request wins
-Number of second requests sent
-Latency percentiles (50th, 90th, 95th, 99th, 99.9th)
-Suggested hedging delay based on the specified percentile
+## Customization
 
-### Logging
+You can customize the load test by modifying:
 
-Logs are written to the log/ directory. The logging system uses a rolling file appender with the following characteristics:
+- Test durations in `LoadTestConfig`
+- Number of iterations in `main.rs`
+- Percentiles to test in `main.rs`
 
-Log files are rotated when they reach 10MB in size.
-A maximum of 20 archived log files are kept.
-The current log file is always named output.log.
-Archived logs are named output-0.log, output-1.log, etc.
+## Results
 
-## Dependencies
+Here's the data converted to a markdown table:
 
-This project uses several Rust crates, including:
+| Iteration | Test Type | Percentile | Total Requests | Successful Requests | Failed Requests | First Requests Won | Second Requests Won | Second Requests Sent | Requests per Second | Success Rate | Hedging Rate | Second Request Win Rate | P1 Latency (ms) | P25 Latency (ms) | P50 Latency (ms) | P75 Latency (ms) | P90 Latency (ms) | P95 Latency (ms) | P99 Latency (ms) | P99.9 Latency (ms) |
+|-----------|-----------|------------|----------------|---------------------|-----------------|--------------------|--------------------|----------------------|---------------------|--------------|--------------|-------------------------|------------------|-------------------|-------------------|-------------------|-------------------|-------------------|-------------------|---------------------|
+| 0         | Non-Hedged| 0.0        | 24785          | 24785               | 0               | 24785              | 0                  | 0                    | 82.62               | 100.00       | 0.00         | 0.00                    | 1.72             | 2.06              | 8.92              | 14.99             | 20.08             | 30.08             | 78.14             | 275.71              |
+| 0         | Hedged    | 99.0       | 25610          | 25610               | 0               | 25547              | 63                 | 83                   | 85.37               | 100.00       | 0.32         | 75.90                   | 1.60             | 1.81              | 2.27              | 8.12              | 11.25             | 13.21             | 16.64             | 28.00               |
+| 0         | Hedged    | 90.0       | 110704         | 110704              | 0               | 109594             | 1110               | 8187                 | 369.01              | 100.00       | 7.40         | 13.56                   | 1.64             | 1.91              | 2.62              | 3.04              | 3.92              | 4.58              | 6.67              | 12.02               |
+| 0         | Hedged    | 75.0       | 137874         | 137874              | 0               | 133929             | 3945               | 19940                | 459.58              | 100.00       | 14.46        | 19.78                   | 1.54             | 1.70              | 1.93              | 2.22              | 2.98              | 4.05              | 4.75              | 10.49               |
+| 0         | Hedged    | 50.0       | 143654         | 143654              | 0               | 134541             | 9113               | 39082                | 478.85              | 100.00       | 27.21        | 23.32                   | 1.46             | 1.67              | 1.78              | 2.03              | 3.48              | 3.62              | 4.01              | 7.31                |
+| 0         | Hedged    | 10.0       | 101175         | 101175              | 0               | 95599              | 5576               | 70223                | 337.25              | 100.00       | 69.41        | 7.94                    | 1.71             | 2.53              | 2.73              | 3.08              | 4.49              | 5.09              | 5.44              | 7.03                |
 
-tokio for async runtime
-rusoto_core and rusoto_dynamodb for AWS DynamoDB interactions
-async-trait for async trait implementations
-uuid for generating unique request IDs
-chrono for timestamps
-serde_json for JSON logging
-clap for command-line argument parsing
-indicatif for progress bars
-log4rs for logging with rotation
-hdrhistogram for latency distribution tracking
 
-# License
-
-MIT 
-
-# Contributing
+## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
+
+## License
+
+This project is licensed under the MIT License.
+This README provides an overview of your project, its structure, how to run it, and what to expect from the output. You may want to add more specific details about your implementation or any special considerations for users of your library.
