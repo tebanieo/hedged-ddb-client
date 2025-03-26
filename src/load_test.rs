@@ -23,6 +23,7 @@ const WARM_UP_BATCH_SIZE: usize = 1;
 const RAMP_UP_INITIAL_BATCH_SIZE: usize = 1;
 const RAMP_UP_STEPS: usize = 1;
 
+// Add this struct at the top of the file
 pub struct LoadTestConfig {
     pub warm_up_duration: Duration,
     pub ramp_up_duration: Duration,
@@ -132,7 +133,7 @@ pub async fn main_load_test(client: &Arc<HedgedDynamoClient>, table_name: &str, 
     
     let start_time = Instant::now();
     let metrics = Arc::new(tokio::sync::Mutex::new(Metrics::new()));
-    
+    // let update_interval = Duration::from_secs(5);
     let mut last_update = Instant::now();
 
     let current_hedging_delay = client.get_hedging_delay();
@@ -175,7 +176,7 @@ pub async fn main_load_test(client: &Arc<HedgedDynamoClient>, table_name: &str, 
                 let p99 = metrics.calculate_percentile(99.0);
 
                 let stats = format!(
-                    "OPS: {:.1} | Hedged: {:.1}% | Win 1: {:.1}% | Win 2: {:.1}% | Delay: {:.2}ms | P50: {:.2}ms | P90: {:.2} | ms P99: {:.2}ms",
+                    "OPS: {:.1} | Hedged: {:.1}% | Win 1: {:.1}% | Win 2: {:.1}% | Delay: {:.2}ms | P50: {:.2}ms | P90: {:.2}ms | P99: {:.2}ms",
                     ops_per_second, 
                     hedged_percent, 
                     win_1_percent, 
@@ -264,7 +265,8 @@ pub async fn run_full_load_test(
             println!("No initial delay provided for hedged test");
         }
     }
-  
+
+    // Run main load test for both non-hedged and hedged tests
     let final_metrics = main_load_test(&client, &table_name, &config).await?;
 
     final_metrics.print_final(config.main_test_duration);
