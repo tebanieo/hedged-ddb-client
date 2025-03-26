@@ -27,15 +27,33 @@ use chrono::Utc;
 use std::error::Error;
 use std::fs;
 use rand::seq::SliceRandom;
-
+use clap::Parser;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use serde_json::Value;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::time::Instant;
 use crate::metrics::TestRunResult;
+use csv::Writer;
 
-use std::io::Write;
+#[derive(Parser, Debug)]
+#[clap(author, version, about, long_about = None)]
+struct Args {
+    #[clap(long, default_value = "3")]
+    iterations: usize,
+
+    #[clap(long, default_value = "60")]
+    warm_up_duration: u64,
+
+    #[clap(long, default_value = "120")]
+    ramp_up_duration: u64,
+
+    #[clap(long, default_value = "300")]
+    main_test_duration: u64,
+
+    #[clap(long, default_value = "10")]
+    update_hedging_duration: u64,
+}
 
 fn setup_logging(test_id: &str) -> Result<(), Box<dyn Error>> {
     // Create a directory for this test run
@@ -75,11 +93,13 @@ fn setup_logging(test_id: &str) -> Result<(), Box<dyn Error>> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+
     let date_test = Utc::now().format("%Y-%m-%dT%H:%M:%S").to_string();
     let _ = setup_logging(&date_test);    
-    let results_dir = ".";
+    let results_dir = "./results";
     fs::create_dir_all(results_dir)?; // Create the directory if it doesn't exist
-    let csv_filename = format!("{}/test_results_{}.csv", results_dir, date_test);
+    // let csv_filename = format!("{}/test_results_{}.csv", results_dir, date_test);
 
     let region_provider = RegionProviderChain::default_provider().or_else(Region::new("us-east-1"));
     let config = aws_config::defaults(aws_config::BehaviorVersion::latest())
@@ -97,36 +117,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let percentiles = vec![99.0, 90.0, 75.0, 50.0, 10.0];
 
     // Number of iterations for the entire test suite
-    let num_iterations = 5;
+    // let num_iterations = 5;
+    let num_iterations = args.iterations;
+
 
     let mut all_results = Vec::new();
     let mut initial_delay = None;
 
     for iteration in 1..=num_iterations {
         println!("Starting iteration {} of {}", iteration, num_iterations);
+        let csv_filename = format!("{}/results_{}_iteration_{}.csv",results_dir, date_test, iteration);
 
         // Run non-hedged test first
         println!("Running non-hedged test for iteration {}", iteration);
-        let non_hedged_result = run_single_test(&config, &test_items, None, iteration, &date_test, None).await?;
+        let non_hedged_result = run_single_test(&config, &test_items, None, iteration, &date_test, None, &args
+        ).await?;
         all_results.push(non_hedged_result.clone());
 
         // Run hedged tests for all percentiles
         for &percentile in &percentiles {
-            // Calculate initial delay for hedged tests based on non-hedged results
             initial_delay = Some(Duration::from_micros(non_hedged_result.metrics.calculate_percentile(percentile) as u64));
             println!("Running hedged test for p{} in iteration {}", percentile, iteration);
-            let hedged_result = run_single_test(&config, &test_items, Some(percentile), iteration, &date_test, initial_delay).await?;
+            let hedged_result = run_single_test(&config, &test_items, Some(percentile), iteration, &date_test, initial_delay, &args
+        ).await?;
             all_results.push(hedged_result);
         }
 
+        // Generate CSV with results after each iteration
+        generate_csv_report(&all_results, &csv_filename)?;
+
         println!("Completed iteration {}", iteration);
+        println!("Completed iteration {}. Results saved to {}", iteration, csv_filename);
+
     }
 
-    // Generate CSV with all results
-    generate_csv_report(&all_results, &csv_filename)?;
-
     println!("All load tests completed");
-    println!("Test results have been saved to {}", csv_filename);
     Ok(())
 }
 
@@ -176,15 +201,17 @@ async fn run_single_test(
     iteration: usize,
     date_test: &str,
     initial_delay: Option<Duration>,
+    args: &Args,
 ) -> Result<TestRunResult, Box<dyn std::error::Error>> {
     let is_hedging_enabled = percentile.is_some();
     let client = Arc::new(HedgedDynamoClient::new(
         config,
-        if is_hedging_enabled {
-            Duration::from_millis(10) // Initial hedging delay when enabled
-        } else {
-            Duration::from_secs(1) // Large delay when disabled
-        },
+        // if is_hedging_enabled {
+        //     Duration::from_millis(10) // Initial hedging delay when enabled
+        // } else {
+        //     Duration::from_secs(1) // Large delay when disabled
+        // },
+        Duration::from_millis(10), // Initial hedging delay when enabled
         is_hedging_enabled
     ));
 
@@ -195,10 +222,10 @@ async fn run_single_test(
     };
 
     let load_test_config = LoadTestConfig {
-        warm_up_duration: Duration::from_secs(60),
-        ramp_up_duration: Duration::from_secs(120),
-        main_test_duration: Duration::from_secs(600),
-        update_hedging_duration: Duration::from_secs(10),
+        warm_up_duration: Duration::from_secs(args.warm_up_duration),
+        ramp_up_duration: Duration::from_secs(args.ramp_up_duration),
+        main_test_duration: Duration::from_secs(args.main_test_duration),
+        update_hedging_duration: Duration::from_secs(args.update_hedging_duration),
         test_id: format!("{}_iter{}_{}", date_test, iteration, test_type),
         percentile: percentile.unwrap_or(0.0), // Use 0.0 for non-hedged tests
         test_items: test_items.to_vec(),
@@ -213,41 +240,63 @@ async fn run_single_test(
 }
 
 fn generate_csv_report(results: &[TestRunResult], filename: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut file = File::create(filename)?;
+    let file = File::create(filename).map_err(|e| {
+        eprintln!("Failed to create file {}: {}", filename, e);
+        e
+    })?;
+    
+    let mut writer = Writer::from_writer(file);
     
     // Write header
-    writeln!(file, "Iteration,Test Type,Percentile,Total Requests,Successful Requests,Failed Requests,First Requests Won,Second Requests Won,Second Requests Sent,Requests per Second,Success Rate,Hedging Rate,Second Request Win Rate,P1 Latency (ms),P25 Latency (ms),P50 Latency (ms),P75 Latency (ms),P90 Latency (ms),P95 Latency (ms),P99 Latency (ms),P99.9 Latency (ms)")?;
+    writer.write_record(&[
+        "Iteration", "Test Type", "Percentile", "Total Requests", "Successful Requests",
+        "Failed Requests", "First Requests Won", "Second Requests Won", "Second Requests Sent",
+        "Requests per Second", "Success Rate", "Hedging Rate", "Second Request Win Rate",
+        "P1 Latency (ms)", "P25 Latency (ms)", "P50 Latency (ms)", "P75 Latency (ms)",
+        "P90 Latency (ms)", "P95 Latency (ms)", "P99 Latency (ms)", "P99.9 Latency (ms)"
+    ]).map_err(|e| {
+        eprintln!("Failed to write header: {}", e);
+        e
+    })?;
 
     // Write data
     for (index, result) in results.iter().enumerate() {
-        let iteration = index / 6; // 7 tests per iteration (1 non-hedged + 6 hedged)
+        let iteration = index / 6;
         let test_type = if result.percentile == 0.0 { "Non-Hedged" } else { "Hedged" };
-        let percentile = format!("{:.1}", result.percentile) ;
+        let percentile = format!("{:.1}", result.percentile);
         
-        writeln!(file, "{},{},{},{},{},{},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2}",
-            iteration,
-            test_type,
+        writer.write_record(&[
+            iteration.to_string(),
+            test_type.to_string(),
             percentile,
-            result.total_requests,
-            result.successful_requests,
-            result.failed_requests,
-            result.first_requests_won,
-            result.second_requests_won,
-            result.second_requests_sent,
-            result.requests_per_second,
-            result.success_rate,
-            result.hedging_rate,
-            result.second_request_win_rate,
-            result.p1_latency,
-            result.p25_latency,
-            result.p50_latency,
-            result.p75_latency,
-            result.p90_latency,
-            result.p95_latency,
-            result.p99_latency,
-            result.p999_latency
-        )?;
+            result.total_requests.to_string(),
+            result.successful_requests.to_string(),
+            result.failed_requests.to_string(),
+            result.first_requests_won.to_string(),
+            result.second_requests_won.to_string(),
+            result.second_requests_sent.to_string(),
+            format!("{:.2}", result.requests_per_second),
+            format!("{:.2}", result.success_rate),
+            format!("{:.2}", result.hedging_rate),
+            format!("{:.2}", result.second_request_win_rate),
+            format!("{:.2}", result.p1_latency),
+            format!("{:.2}", result.p25_latency),
+            format!("{:.2}", result.p50_latency),
+            format!("{:.2}", result.p75_latency),
+            format!("{:.2}", result.p90_latency),
+            format!("{:.2}", result.p95_latency),
+            format!("{:.2}", result.p99_latency),
+            format!("{:.2}", result.p999_latency)
+        ]).map_err(|e| {
+            eprintln!("Failed to write record: {}", e);
+            e
+        })?;
     }
+
+    writer.flush().map_err(|e| {
+        eprintln!("Failed to flush writer: {}", e);
+        e
+    })?;
 
     Ok(())
 }
